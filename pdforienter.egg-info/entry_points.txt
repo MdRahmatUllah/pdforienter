@@ -1,0 +1,2 @@
+[console_scripts]
+pdforienter = pdforienter.cli:main
