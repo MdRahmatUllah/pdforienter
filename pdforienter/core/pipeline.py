@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from pdforienter.config import MAX_WORKERS, CPU_COUNT
+from pdforienter.config import MAX_WORKERS
 from pdforienter.core.processor import process_file
 from pdforienter.models import FileResult, RunResult
 from pdforienter.utils.fs import ensure_dir

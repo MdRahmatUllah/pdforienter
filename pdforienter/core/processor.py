@@ -75,7 +75,7 @@ def process_file(input_path: str, output_dir: str) -> FileResult:
 
 def _page_count(pdf_path: str) -> int:
     doc = fitz.open(pdf_path)
-    count = doc.page_count
+    count = int(doc.page_count)
     doc.close()
     return count
 

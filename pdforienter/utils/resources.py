@@ -14,7 +14,7 @@ import psutil
 def peak_ram_mb() -> float:
     """Return the current process RSS memory usage in megabytes."""
     process = psutil.Process(os.getpid())
-    return process.memory_info().rss / (1024 ** 2)
+    return float(process.memory_info().rss) / (1024 ** 2)
 
 
 def cpu_count() -> int:

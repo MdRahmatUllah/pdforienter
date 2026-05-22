@@ -6,6 +6,8 @@ Public API
     run_pipeline(pdf_paths, output_dir) -> RunResult
 """
 
+from typing import Any
+
 from pdforienter.models import FileResult, PageResult, PageType, RunResult
 
 __all__ = [
@@ -19,7 +21,7 @@ __all__ = [
 __version__ = "0.1.0"
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     # Lazy export — defer importing the pipeline (and its transitive
     # pytesseract / PyMuPDF dependencies) until the symbol is actually used.
     if name == "run_pipeline":
