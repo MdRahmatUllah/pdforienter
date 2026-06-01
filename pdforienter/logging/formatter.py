@@ -43,7 +43,7 @@ def _run_summary(r: RunResult) -> str:
         f"  Scanned pages (OCR)   : {r.total_scanned_pages}\n"
         f"  Skipped pages         : {r.total_skipped_pages}\n"
         f"  Workers used          : {r.workers_used}\n"
-        f"  Peak RAM usage        : {r.peak_ram_mb:.1f} MB\n"
+        f"  Current RAM usage     : {r.current_ram_mb:.1f} MB\n"
         f"  Total time            : {r.total_duration_seconds:.2f}s\n"
     )
 

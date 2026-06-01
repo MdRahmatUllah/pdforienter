@@ -198,11 +198,58 @@ MAX_WORKERS = max(1, math.floor(os.cpu_count() * 0.75))
 
 **Confidence threshold:** OSD returns a confidence score (0–100). Results below `OSD_CONFIDENCE_THRESHOLD` (default: 10.0) are discarded and the page is treated as requiring no correction. This prevents low-quality or nearly-blank scanned pages from triggering spurious rotations.
 
-### 4.6 Render at 150 DPI for OSD
+### 4.4.1 Idempotent Correction (Absolute Target /Rotate)
 
-**Decision:** When rasterising a page for Tesseract OSD, use 150 DPI.
+**Decision:** The analyzer normalises both detector strategies to "absolute target `/Rotate` value" and computes the relative correction from `existing_rotation`. Re-running pdforienter on its own output is a no-op.
 
-**Why:** Higher DPI increases image size and therefore both memory and Tesseract processing time. Lower DPI risks missing text features that OSD needs. At 150 DPI, a standard A4 page becomes a ~1240×1754 pixel image — sufficient for reliable script and orientation detection without the memory overhead of 300 DPI (which would quadruple the image size).
+**Why:** The two detection strategies have different return semantics:
+
+- `text_orientation_from_dict` reads `dir` vectors from the content stream. PyMuPDF returns these in the content stream's native coordinates, ignoring `/Rotate` metadata. So the returned angle is the **absolute** target `/Rotate` that would make the content display upright.
+- `osd_orientation` rasterises via `page.get_pixmap()`, which applies `/Rotate` by default. OSD sees the already-rotated image and returns the **relative** additional rotation needed.
+
+A naive `new_rotation = existing_rotation + detected_angle` works on a fresh file (`existing_rotation=0`) but cascades on the corrected output (existing=90, detected=90 → new=180; next pass 180+180=0; oscillates). The fix:
+
+```python
+# Normalise OSD to absolute.
+detected_angle = (existing_rotation + osd_relative) % 360   # OSD path
+# Text path is already absolute — use raw_angle as detected_angle.
+
+# Compute the delta needed.
+correction = (detected_angle - existing_rotation) % 360
+
+# changed iff correction != 0
+new_rotation = (existing_rotation + correction) % 360       # equals detected_angle
+```
+
+This also normalises a PDF that has `/Rotate=N` set but draws content upright (e.g., a stale tool wrote it) — pdforienter rewrites `/Rotate` to 0 so the visible content is upright.
+
+**Trade-off:** Pages where a user deliberately set `/Rotate` for some non-content reason (rare) will have that metadata overwritten. We consider this correct: the project's job is to make the visible content upright, not to preserve cosmetic metadata.
+
+### 4.4.2 Bake Rotation Into Content (Default)
+
+**Decision:** By default, physically rotate page content so the output is upright with `/Rotate=0`, rather than only setting the `/Rotate` page attribute.
+
+**Why:** Setting `/Rotate` is spec-correct and every compliant viewer honours it — but a surprising number of real-world consumers do **not**: image converters (`pdf2image`, ImageMagick), some print drivers, certain OCR front-ends, and thumbnail generators frequently rasterise the content stream while ignoring `/Rotate`. For those, a page "corrected" with metadata-only rotation still comes out sideways. Baking the rotation into the content stream guarantees the page is upright in every tool, no exceptions.
+
+**How:** For each page, reset the source `/Rotate` to 0 and re-embed it via `show_pdf_page(rect, src, idx, rotate=(360 - detected_angle) % 360)`, swapping width/height for 90/270. The bake angle is the inverse of the target `/Rotate` because `show_pdf_page` rotates counter-clockwise while `/Rotate` is clockwise. The result has `/Rotate=0` and content text running left-to-right — verified objectively in `test_rotation.py` by asserting both `page.rotation == 0` and first-line `dir ≈ (1, 0)`.
+
+**Trade-off:** `show_pdf_page` re-embeds each page as a Form XObject. Vector text survives and remains selectable, but page-level annotations, links, and form fields are dropped, and the file is slightly larger. Users who need those preserved can pass `bake=False` (CLI `--no-bake`) for the lossless metadata-only path. For the project's target workload — scanned/exported documents being normalised for downstream processing — baking is the right default.
+
+### 4.5.1 Multi-Pass OSD
+
+**Decision:** Run Tesseract OSD four times per scanned page — once on the original rasterised image and once on each of the 90/180/270 pre-rotated variants — and pick the orientation where OSD reports `rotate=0` with the highest confidence.
+
+**Why:** Empirical testing against real scanned German receipts and invoices showed single-pass OSD was wildly unreliable: Tesseract often reported the wrong angle with very low confidence (1–5%) on its first look at a rotated page. But Tesseract is far more accurate at confirming "this image is upright" when it actually IS upright. Asking the same question four times — "is this orientation upright?" — and taking the strongest yes lifts scanned-page detection from ~30% to ~100% on the project's test corpus.
+
+**Trade-off:** Four OSD calls per scanned page instead of one. On the test corpus this costs ~9 seconds of worker time per scanned page (at 300 DPI), but because pages run in parallel across `MAX_WORKERS` it adds only seconds of wall-clock per batch. Text pages are unaffected — they never enter the OSD path.
+
+### 4.6 Render at 300 DPI for OSD
+
+**Decision:** When rasterising a page for Tesseract OSD, use 300 DPI.
+
+**Why:** At 150 DPI (the original choice), Tesseract OSD reports ~1–3% confidence on real-world German receipts and invoices — completely unusable. At 300 DPI, the same content yields ~12–15% confidence (well above the 10% threshold). The memory cost is real (a 300 DPI A4 grayscale page is roughly 8 MB vs 2 MB at 150 DPI), but the worker pool budget at 75% of cores leaves easily enough headroom — 6 workers × 8 MB ≈ 50 MB of pixmap data at any moment, far below the 1–2 GB envelope.
+
+**Trade-off:** ~4× slower per OSD call than 150 DPI. Compensated for by the fact that the slower DPI also failed silently — every "fast" miss was a real rotation we should have caught.
 
 ### 4.7 Grayscale Rasterisation
 
@@ -282,7 +329,7 @@ Reads the raw text block structure from PyMuPDF. Each text line carries a direct
 
 **Function:** `osd_orientation(page) -> tuple[int, float]`
 
-Rasterises the page to a grayscale PIL image at 150 DPI and passes it to `pytesseract.image_to_osd`. Parses the returned dictionary for `rotate` and `orientation_conf`. Returns `(0, 0.0)` on any error, ensuring the system degrades gracefully rather than crashes.
+Rasterises the page to a grayscale PIL image at **300 DPI** and runs **multi-pass OSD**: `pytesseract.image_to_osd` is called four times, once on the image and once on each of the 90/180/270 pre-rotated variants. The pre-rotation that makes OSD report `rotate=0` with the highest confidence is the correction angle. Returns `(0, best_conf)` if no orientation clears `OSD_CONFIDENCE_THRESHOLD`, or `(0, 0.0)` on any exception. Honours the `TESSERACT_CMD` environment variable so users on Windows whose Tesseract is installed but not on PATH can point at the binary directly.
 
 **Function:** `_direction_to_angle(direction) -> int`
 
@@ -302,29 +349,37 @@ This is the unit of work sent to each `ProcessPoolExecutor` worker. It opens the
 
 ### `core/corrector.py`
 
-**Responsibility:** Apply a set of rotation corrections to a PDF in a single write pass.
+**Responsibility:** Apply rotation corrections to a PDF in a single write pass. Two strategies, selected by the `bake` keyword.
 
-**Function:** `apply_rotations(input_path, output_path, page_results) -> float`
+**Function:** `apply_rotations(input_path, output_path, page_results, *, bake=True) -> float`
 
-Opens the source PDF, iterates over the `PageResult` list, and for every `changed=True` entry calls `page.set_rotation()` with the normalised combined rotation (`existing + correction mod 360`). Saves once with `garbage=4` (maximum cross-reference table compaction) and `deflate=True` (compression). Returns the wall-clock seconds spent.
+Dispatches to one of two writers and returns the wall-clock seconds spent. Both save once with `garbage=4` (cross-reference compaction) and `deflate=True` (compression).
+
+**Function:** `_write_baked(input_path, output_path, page_results)` — the default
+
+Physically rotates content so the output is upright with `/Rotate=0`, working in **every** viewer and tool (including ones that ignore `/Rotate`: image converters, some print drivers, OCR front-ends). For each page it resets the source `/Rotate` to 0, then re-embeds the page into a fresh page via `show_pdf_page(rect, src, idx, rotate=bake_angle)` where `bake_angle = (360 - detected_angle) % 360`. The inversion is necessary because `show_pdf_page`'s `rotate` is counter-clockwise while `/Rotate` is clockwise. Width/height are swapped when `detected_angle` is 90 or 270. Vector text is preserved (re-embedded as a Form XObject, still selectable); page-level annotations, links, and form fields are **not** carried over.
+
+**Function:** `_write_metadata_only(input_path, output_path, page_results)` — `bake=False`
+
+Sets `page.set_rotation(detected_angle)` on changed pages and leaves the content stream untouched. Lossless (annotations/links/form fields preserved) and spec-correct, but relies on the consumer honouring `/Rotate`.
 
 **Function:** `_normalise_rotation(degrees: int) -> int`
 
-Reduces any angle to the range `[0, 360)` using modular arithmetic. Handles cases where the combination of existing rotation and detected correction exceeds 360°.
+Reduces any angle to the range `[0, 360)` using modular arithmetic.
 
 ---
 
 ### `core/processor.py`
 
-**Responsibility:** Coordinate Phase 1 (parallel detection) and Phase 2 (single-pass correction) for one PDF file.
+**Responsibility:** Per-file plumbing for the pipeline. The pool itself lives one layer up in `pipeline.py`; this module just validates inputs and assembles per-file results.
 
-**Function:** `process_file(input_path, output_dir) -> FileResult`
+**Function:** `prepare_file(input_path, output_dir) -> FileSpec`
 
-The primary per-file entry point. Calls `_detect_all_pages` then `_correct_file`. Wraps the entire operation in a try/except so a completely unreadable PDF produces a `FileResult` with an error field rather than an unhandled exception.
+Pre-flight validation for one input. Builds the output path, enforces `MAX_FILE_SIZE_MB`, opens the PDF just long enough to read the page count, then returns a `FileSpec` describing the file. File-level failures (missing file, oversize, unopenable PDF) are captured as `FileSpec.error` rather than raised — the pipeline still needs a `FileResult` for the failed file so it appears in the log.
 
-**Function:** `_detect_all_pages(pdf_path, page_count) -> list[PageResult]`
+**Function:** `build_file_result(spec, page_results, *, audit) -> FileResult`
 
-Opens a `ProcessPoolExecutor` and submits one `analyse_page` future per page. Uses `as_completed` to collect results as they arrive — workers that finish quickly do not block slower workers. Results are reassembled into page-order before returning.
+Called by the pipeline once a file's per-page detections are in hand. Assembles the final `FileResult`. When `audit=True`, skips Phase 2 entirely (no rotation, no copy) but still reports the detection summary.
 
 **Function:** `_correct_file(input_path, output_path, page_results) -> float`
 
@@ -334,13 +389,13 @@ Short-circuits if no pages need rotation: copies the input file to the output pa
 
 ### `core/pipeline.py`
 
-**Responsibility:** Top-level orchestration across multiple files.
+**Responsibility:** Top-level orchestration. Owns the single shared `ProcessPoolExecutor` that handles every page from every file in the batch.
 
-**Function:** `run_pipeline(pdf_paths, output_dir) -> RunResult`
+**Function:** `run_pipeline(pdf_paths, output_dir, *, workers=None, audit=False) -> RunResult`
 
-Iterates over the input file list, calls `process_file` for each, and aggregates all `FileResult` instances into a `RunResult`. Ensures the output directory exists before any file is processed.
+Pre-flights every file via `prepare_file`, then opens **one** `ProcessPoolExecutor` for the whole batch and submits every page from every valid file to it. Collects results via `as_completed`, then runs Phase 2 per file via `build_file_result`. Ensures the output directory exists before dispatch.
 
-> **Note on multi-file parallelism:** The current implementation processes files sequentially at the pipeline level while parallelising pages within each file. This is intentional for the initial release — within-file page parallelism already saturates the worker pool. Future versions may add file-level parallelism for batches of small PDFs.
+Multi-file parallelism is intrinsic: with `workers > 1` and multiple files, the pool happily mixes pages from different files on the same workers. The pool budget (`MAX_WORKERS`, overridable via the `workers=` keyword) is not divided between file-level and page-level — every page is just one item in a single flat queue.
 
 ---
 
@@ -372,7 +427,7 @@ Creates a timestamped log file (`pdforienter_YYYYMMDD_HHMMSS.log`) in the output
 
 **Responsibility:** Runtime resource telemetry.
 
-`peak_ram_mb` returns the current process's resident set size in megabytes via `psutil`. Called at the end of a run to capture approximate peak memory. `cpu_count` is a thin wrapper around `os.cpu_count()`.
+`current_ram_mb` returns the current process's resident set size in megabytes via `psutil`. Sampled at the end of the run as a rough sanity check — note that it is *current* RSS, not a true high-water mark, so freed pixmaps and Tesseract buffers are not reflected. `cpu_count` is a thin wrapper around `os.cpu_count()`.
 
 ---
 
@@ -447,13 +502,17 @@ Span-weighting means lines with more text content have more influence than short
 For image-only pages, there is no text vector data. The page must be rasterised and Tesseract must analyse the resulting bitmap.
 
 ```
-page  →  fitz.get_pixmap(dpi=150, colorspace=GRAY)
+page  →  fitz.get_pixmap(dpi=300, colorspace=GRAY)
       →  PIL.Image (L mode)
-      →  pytesseract.image_to_osd(psm=0)
-      →  { "rotate": 90, "orientation_conf": 87.5, ... }
+      →  multi-pass: for pre_rotation in (0, 90, 180, 270):
+             img.rotate(-pre_rotation) → pytesseract.image_to_osd(psm=0)
+             → keep pre_rotation where OSD says rotate=0 with highest confidence
+      →  ( correction_angle, confidence )
 ```
 
-The OSD result includes a rotation angle and a confidence score. If confidence is below `OSD_CONFIDENCE_THRESHOLD`, the result is discarded and the page is left unchanged. This is conservative by design — a wrong rotation is more damaging than a missed correction.
+OSD on a single orientation is unreliable on real-world scanned content (confidence typically <5%). Asking it four times — "is the image upright in this orientation?" — and trusting the strongest yes is empirically more accurate. The winning `pre_rotation` is the correction angle: rotating the page that many degrees CW makes its content read upright.
+
+If no orientation produces confidence above `OSD_CONFIDENCE_THRESHOLD`, the result is discarded and the page is left unchanged. Conservative by design — a wrong rotation is more damaging than a missed correction.
 
 ### 7.3 Strategy Selection
 
@@ -470,17 +529,21 @@ else:
 
 ### 8.1 Worker Pool Lifecycle
 
-A single `ProcessPoolExecutor` is created for each PDF file processed. All page analysis futures are submitted before any results are collected. `as_completed` is used so that faster workers (text pages) are collected without waiting for slower workers (scanned pages), and the pool is kept as busy as possible throughout.
+A single `ProcessPoolExecutor` is created for the **entire batch**, not per file. All page analysis futures from every valid file are submitted to it before any results are collected. `as_completed` is used so that faster workers (text pages) are collected without waiting for slower workers (scanned pages), and the pool is kept as busy as possible throughout — including by mixing pages from different files on the same worker.
 
 ```python
-with ProcessPoolExecutor(max_workers=MAX_WORKERS) as pool:
-    future_map = {
-        pool.submit(analyse_page, pdf_path, idx): idx
-        for idx in range(page_count)
-    }
-    for future in as_completed(future_map):
-        results[future_map[future]] = future.result()
+with ProcessPoolExecutor(max_workers=worker_count) as pool:
+    futures = {}
+    for spec in valid_specs:
+        for page_index in range(spec.page_count):
+            fut = pool.submit(analyse_page, spec.input_path, page_index)
+            futures[fut] = (spec.input_path, page_index)
+    for fut in as_completed(futures):
+        path, page_index = futures[fut]
+        results[path][page_index] = fut.result()
 ```
+
+This is intentionally a flat queue, not nested pools. Worker count remains capped at `MAX_WORKERS` (default; overridable via `run_pipeline(..., workers=N)`) regardless of how many files are in the batch, so a 50-file batch on an 8-core server still uses 6 workers — it just spreads them across files instead of finishing one file at a time.
 
 The context manager ensures all workers are cleanly shut down even if an exception propagates.
 
@@ -547,9 +610,10 @@ Input: list[str]  (PDF file paths)
          │
          │ for each file
          ▼
-      processor.process_file()
+      pipeline submits every page from every valid file
+      to one shared ProcessPoolExecutor
          │
-         │ Phase 1: for each page (parallel)
+         │ Phase 1: workers mix pages from different files
          ▼
       analyzer.analyse_page()  →  PageResult
          │
@@ -597,7 +661,7 @@ PDFOrienter Run Log — 2024-11-01 14:32:05
   Scanned pages (OCR)   : 46
   Skipped pages         : 0
   Workers used          : 6
-  Peak RAM usage        : 312.4 MB
+  Current RAM usage     : 312.4 MB
   Total time            : 42.18s
 
 ------------------------------------------------------------
@@ -623,7 +687,7 @@ Three timing values are recorded per file:
 
 - **Detection time** — sum of all `PageResult.duration_seconds`. Because pages run in parallel, this is *total worker time*, not wall-clock time. It can exceed the file's wall-clock duration.
 - **Correction time** — wall-clock seconds for the single-pass PyMuPDF write.
-- **Total time** — wall-clock seconds from `process_file` start to end.
+- **Total time** — sum of detection time + correction time. With the shared-pool model files overlap in wall-clock, so per-file wall-clock is no longer meaningful — this number is closer to "how long would this file have taken alone" than to elapsed seconds.
 
 ---
 
@@ -789,7 +853,7 @@ for fr in result.file_results:
 |---|---|---|
 | Image-only pages with very little text may be skipped | OSD requires enough text to detect orientation | Accepted trade-off; flagged as `SKIPPED` in log |
 | Very low-confidence OSD results are ignored | Prevents wrong corrections | Page left unchanged; visible in log |
-| Multi-file parallelism not implemented | Within-file parallelism already saturates workers | Planned for v0.2 |
+| Audit mode skips Phase 2 entirely (no input copy either) | By design — `--audit` is for read-only inspection | Use full mode if a copy of every input is needed |
 | No support for password-protected PDFs | PyMuPDF raises an error on encrypted files | Returns `FileResult` with `error` field |
 | Arabic / Hebrew right-to-left text may confuse vector strategy | RTL text direction vectors differ | OSD fallback partially mitigates this |
 | No OCR output — only orientation | OSD mode is orientation-only by design | Not a rotation-correction limitation |
@@ -809,20 +873,6 @@ def my_orientation(page: fitz.Page) -> tuple[int, float]:
 ```
 
 Then update `analyzer.py` to call it under the appropriate condition.
-
-### Adding File-Level Parallelism
-
-In `pipeline.py`, replace the sequential loop with a `ProcessPoolExecutor`:
-
-```python
-with ProcessPoolExecutor(max_workers=MAX_WORKERS) as pool:
-    file_results = list(pool.map(
-        lambda p: process_file(p, output_dir),
-        pdf_paths
-    ))
-```
-
-Note: this would share the same worker pool budget with within-file page parallelism, so `MAX_WORKERS` may need to be divided between the two levels.
 
 ### Changing the Output Format
 

@@ -81,3 +81,7 @@ Thumbs.db
 output/
 corrected/
 /tmp/
+
+# Local test fixtures — real, sensitive documents. NEVER commit these.
+test-package/test-data/
+test-package/page-thumbs/

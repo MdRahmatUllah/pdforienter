@@ -61,6 +61,6 @@ class RunResult:
     total_scanned_pages: int
     total_skipped_pages: int
     workers_used: int
-    peak_ram_mb: float
+    current_ram_mb: float
     total_duration_seconds: float
     file_results: list[FileResult] = field(default_factory=list)

@@ -110,7 +110,7 @@ PDFOrienter Run Log — 2024-11-01 14:32:05
   Scanned pages (OCR)   : 46
   Skipped pages         : 0
   Workers used          : 6
-  Peak RAM usage        : 312.4 MB
+  Current RAM usage     : 312.4 MB
   Total time            : 42.18s
 
 ------------------------------------------------------------
@@ -186,12 +186,22 @@ For each page:
 1. **Classify** — does the page have selectable text?
 2. **Detect orientation**
    - *Text page* → analyse character direction vectors (fast, no OCR)
-   - *Scanned page* → rasterise at 150 DPI and run Tesseract OSD
+   - *Scanned page* → rasterise at 300 DPI and run multi-pass Tesseract OSD
 3. Return a `PageResult` with the detected angle, confidence, and timing
 
 ### Phase 2 — Single-Pass Correction
 
-After all pages are analysed, a single `fitz.Document.save()` call applies every rotation and writes the corrected PDF. No intermediate files are created.
+After all pages are analysed, a single write pass produces the corrected PDF. By default PDFOrienter **bakes** the rotation into each page's content so the output is genuinely upright with `/Rotate=0` — it displays correctly in *every* viewer and tool, including those that ignore the `/Rotate` page attribute (image converters, some print drivers, OCR front-ends).
+
+Vector text stays selectable after baking, but page-level annotations, links, and form fields are not preserved. If you need those, pass `--no-bake` (CLI) or `bake=False` (API) for lossless metadata-only rotation that sets `/Rotate` instead.
+
+```bash
+# Default: physically upright output, works everywhere
+pdforienter scan.pdf --output ./fixed
+
+# Lossless: keep annotations/forms, rely on viewer honouring /Rotate
+pdforienter scan.pdf --output ./fixed --no-bake
+```
 
 ---
 

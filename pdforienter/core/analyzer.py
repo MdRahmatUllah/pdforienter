@@ -12,8 +12,8 @@ import time
 
 import fitz  # PyMuPDF
 
-from pdforienter.core.classifier import has_text_layer
-from pdforienter.core.detector import osd_orientation, text_orientation
+from pdforienter.core.classifier import has_text_layer_from_dict
+from pdforienter.core.detector import osd_orientation, text_orientation_from_dict
 from pdforienter.models import PageResult, PageType
 
 
@@ -36,21 +36,46 @@ def analyse_page(pdf_path: str, page_index: int) -> PageResult:
         page = doc[page_index]
         existing_rotation = int(page.rotation)
 
-        if has_text_layer(page):
+        # Extract the text dict once and feed both classifier and detector,
+        # rather than paying for two separate PyMuPDF text passes.
+        text_dict = page.get_text("dict")
+
+        # Detector return-value semantics differ between strategies:
+        #   - text_orientation reads `dir` vectors from the content stream.
+        #     `dir` is independent of /Rotate, so the returned angle is the
+        #     ABSOLUTE target /Rotate needed to make the content read upright.
+        #   - osd_orientation rasterises via `get_pixmap`, which APPLIES
+        #     /Rotate by default. OSD therefore sees the already-rotated
+        #     image and returns the RELATIVE additional rotation needed.
+        #
+        # We normalise both to "absolute target /Rotate" (`detected_angle`)
+        # and derive the relative delta (`correction`) from it. Without this
+        # normalisation, re-running pdforienter on its own output would
+        # cascade rotations (existing 90 + detected 90 = 180, etc).
+        if has_text_layer_from_dict(text_dict):
             page_type = PageType.TEXT
-            detected_angle, confidence = text_orientation(page)
+            raw_angle, confidence = text_orientation_from_dict(text_dict)
+            detected_angle = raw_angle  # already absolute
         else:
             page_type = PageType.SCANNED
-            detected_angle, confidence = osd_orientation(page)
+            relative_angle, confidence = osd_orientation(page)
+            detected_angle = (existing_rotation + relative_angle) % 360
 
-        if detected_angle == 0:
+        correction = (detected_angle - existing_rotation) % 360
+
+        if correction == 0:
             changed = False
-            correction = 0
-            reason = "No rotation needed."
+            reason = (
+                f"Page already at correct /Rotate ({existing_rotation}°)."
+                if existing_rotation
+                else "No rotation needed."
+            )
         else:
             changed = True
-            correction = detected_angle
-            reason = f"Rotation of {detected_angle}° detected (confidence {confidence:.1f})."
+            reason = (
+                f"Rotating by {correction}° to reach /Rotate={detected_angle}° "
+                f"(was {existing_rotation}°, confidence {confidence:.1f})."
+            )
 
     except Exception as exc:  # noqa: BLE001
         return PageResult(

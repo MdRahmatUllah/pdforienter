@@ -92,7 +92,7 @@ def _make_run_result() -> RunResult:
         total_scanned_pages=0,
         total_skipped_pages=0,
         workers_used=4,
-        peak_ram_mb=120.0,
+        current_ram_mb=120.0,
         total_duration_seconds=0.1,
         file_results=[fr],
     )
